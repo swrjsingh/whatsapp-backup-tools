@@ -14,6 +14,9 @@ Compared against WhatsApp Desktop **2.26.41.28** (reference shots in `logs/ui-co
 | More → Starred in rail | More → Starred + count in rail + list row | **Partial** |
 | Communities listed under More with chevrons | Communities nav tab + list | **Partial** — placement differs |
 | Profile + pencil at bottom | “S” circle at bottom; **Reset** moved to Settings | **Partial** (no pencil; no real PfP) |
+| PfPs from backup + ingested `viewer-assets/` | Group/contact icons when bytes in archive; no live Desktop reads | **Partial** (~266/611 groups; ingest script) |
+| 1:1 / contact thread load | Fixed `j_chat.user` on recent_messages poll query (500 → 200) | **Fixed** |
+| Scroll history before recent cache floor | Fixed `noMoreOlder` on short initial page (<50) | **Fixed** (e.g. Sakshi → Aug 2023) |
 
 ## Chat list column
 
@@ -26,7 +29,7 @@ Compared against WhatsApp Desktop **2.26.41.28** (reference shots in `logs/ui-co
 | Pinned: CompSoc, ವಿಧಾನ, S1+S2 CSE | Same three (viewer pin table) | OK |
 | Single pin glyph under time | Was double (CSS + JS); now one pin under time | **Fixed** |
 | Green draft previews | Not in backup | Omitted |
-| Archived “Edit” header | No Edit | Open (read-only OK as placeholder) |
+| Archived “Edit” header | Edit shown on Archived/Starred (placeholder toast) | **Partial** (visual OK) |
 | Community row subtitle “Announcements” | Added for `is_community` | **Fixed** |
 
 ## Empty / no chat selected

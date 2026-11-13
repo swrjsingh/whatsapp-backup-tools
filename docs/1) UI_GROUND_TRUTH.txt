@@ -19,6 +19,9 @@ Use with INTENT.md §3 and FEATURES.md when implementing clone parity.
 13-community-info-announcements-tab.jpg — Community info modal; Announcements tab
 14-community-info-community-tab.jpg — Community info modal; Community tab; members
 15-community-view-groups-overlay.png — View groups full list overlay from community
+16-chats-list-context-menu.jpg — Right-click chat row: Close, Archive, Mute, Group info, etc.
+17-message-select-toolbar.jpg — Message selected; bottom bar 1 Selected + Reply/Star/Forward/Delete
+18-message-context-menu-reply.jpg — Message context menu; Reply row highlighted green
 
 Cursor chat assets (original uploads, same bytes as above where copied):
   ~/.cursor/projects/.../assets/image-*.png|jpg — ephemeral; repo copies are canonical.

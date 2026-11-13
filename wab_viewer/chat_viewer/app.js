@@ -180,13 +180,23 @@
     el.textContent = prettyLabel(msg.sender || phone || '');
   }
 
+  function avatarUrl(chat, isGroup) {
+    const params = new URLSearchParams({
+      chat_id: String(chat.id),
+      chat_type: chat.type || (isGroup ? 'group' : 'contact'),
+    });
+    return '/api/avatar?' + params.toString();
+  }
+
   function avatarHtml(name, isGroup, chat) {
     if (chat && chat.has_avatar) {
-      const url = '/api/avatar?' + new URLSearchParams({
-        chat_id: chat.id,
-        chat_type: chat.type || (isGroup ? 'group' : 'contact'),
-      });
-      return `<div class="chat-avatar has-photo"><img src="${esc(url)}" alt=""></div>`;
+      const url = avatarUrl(chat, isGroup);
+      const inner = isGroup ? GROUP_AVATAR : (PERSON_AVATAR);
+      return (
+        `<div class="chat-avatar has-photo${isGroup ? ' group' : ''}">` +
+        `<img src="${url}" alt="" onerror="this.remove();this.parentElement.classList.remove('has-photo');">` +
+        `${inner}</div>`
+      );
     }
     const label = prettyLabel(name);
     const letter = label && !label.startsWith('+') && !/^\d/.test(label) ? [...label][0].toUpperCase() : '';
@@ -412,7 +422,7 @@
     items.forEach(it => {
       const btn = document.createElement('button');
       btn.type = 'button';
-      btn.className = 'ctx-item' + (it.danger ? ' danger' : '') + (it.disabled ? ' disabled' : '');
+      btn.className = 'ctx-item' + (it.primary ? ' primary' : '') + (it.danger ? ' danger' : '') + (it.disabled ? ' disabled' : '');
       btn.textContent = it.label;
       btn.disabled = !!it.disabled;
       if (!it.disabled && it.action) btn.addEventListener('click', e => {
@@ -704,9 +714,10 @@
   const MEDIA_LABELS = {image:'📷 Photo', video:'🎥 Video', audio:'🎵 Voice message',
                         gif:'🎞 GIF', sticker:'🎭 Sticker', document:'📄 Document', link:'🔗 Link'};
   function tickHtml(receipt) {
-    if (receipt === 'read' || receipt === 13 || receipt === 8) return '<span class="tick read">✓✓</span> ';
-    if (receipt === 'delivered' || receipt === 5) return '<span class="tick">✓✓</span> ';
-    if (receipt === 'sent' || receipt === 0 || receipt === 4) return '<span class="tick">✓</span> ';
+    const n = typeof receipt === 'number' ? receipt : Number(receipt);
+    if (receipt === 'read' || n === 13 || n === 8 || n === 6) return '<span class="tick read">✓✓</span> ';
+    if (receipt === 'delivered' || n === 5) return '<span class="tick">✓✓</span> ';
+    if (receipt === 'sent' || n === 0 || n === 4 || n === 2) return '<span class="tick">✓</span> ';
     return '';
   }
 
@@ -734,7 +745,117 @@
     return (prefix + esc(text.slice(0, 80))) || '…';
   }
 
+  let currentNavScreen = 'chats';
+  let msgSelectMode = false;
+  const msgSelected = new Set();
+
+  function hideAllSidebarPanels() {
+    ['chat-list', 'search-results', 'nav-screen-updates', 'nav-screen-calls', 'nav-screen-media', 'community-cards-panel', 'community-detail-panel'].forEach(id => {
+      const el = document.getElementById(id);
+      if (!el) return;
+      if (id === 'chat-list') el.style.display = 'none';
+      else el.hidden = true;
+    });
+  }
+
+  function syncSidebarChrome() {
+    const title = document.getElementById('sidebar-title');
+    const editBtn = document.getElementById('sidebar-edit-btn');
+    const newChat = document.getElementById('sidebar-new-chat-btn');
+    const addBtn = document.getElementById('sidebar-add-btn');
+    if (!title) return;
+    editBtn.hidden = true;
+    newChat.hidden = false;
+    addBtn.hidden = true;
+    if (showingArchived) {
+      title.textContent = 'Archived';
+      editBtn.hidden = false;
+      newChat.hidden = true;
+    } else if (showingStarred) {
+      title.textContent = 'Starred';
+      editBtn.hidden = false;
+      newChat.hidden = true;
+    } else if (currentNavScreen === 'communities' || currentNavScreen === 'community-detail') {
+      title.textContent = 'Communities';
+      newChat.hidden = true;
+      addBtn.hidden = false;
+    } else if (currentNavScreen === 'updates') title.textContent = 'Updates';
+    else if (currentNavScreen === 'calls') title.textContent = 'Calls';
+    else if (currentNavScreen === 'media') title.textContent = 'Media';
+    else title.textContent = 'Chats';
+  }
+
+  function setRightPanePlaceholder(mode) {
+    const empty = document.getElementById('empty-pane');
+    ['updates', 'calls', 'media'].forEach(m => {
+      const ph = document.getElementById('pane-placeholder-' + m);
+      if (ph) ph.hidden = m !== mode;
+    });
+    const chatOpen = !!currentChat;
+    if (empty) empty.style.display = (!chatOpen && (!mode || mode === 'default')) ? 'flex' : 'none';
+    if (!chatOpen && mode && mode !== 'default') {
+      document.getElementById('chat-header').style.display = 'none';
+      document.getElementById('message-scroll').style.display = 'none';
+      document.getElementById('community-panel').hidden = true;
+    }
+  }
+
+  function enterNavScreen(screen) {
+    currentNavScreen = screen;
+    hideAllSidebarPanels();
+    document.getElementById('community-detail-panel').hidden = true;
+    document.getElementById('sidebar-filters').style.display = screen === 'chats' ? '' : 'none';
+    const showSearch = screen === 'chats' && !showingArchived && !showingStarred;
+    document.getElementById('search-box').style.display = showSearch ? '' : 'none';
+    syncSidebarChrome();
+    if (screen === 'chats') {
+      document.getElementById('chat-list').style.display = '';
+      setRightPanePlaceholder('default');
+      return;
+    }
+    const idMap = {
+      updates: 'nav-screen-updates',
+      calls: 'nav-screen-calls',
+      media: 'nav-screen-media',
+      communities: 'community-cards-panel',
+    };
+    const panel = document.getElementById(idMap[screen]);
+    if (panel) panel.hidden = false;
+    setRightPanePlaceholder(screen);
+    if (screen === 'calls') loadCallsScreen();
+    if (screen === 'media') loadMediaScreen();
+    if (screen === 'communities') loadCommunityCards();
+  }
+
+  function clearMsgSelection() {
+    msgSelectMode = false;
+    msgSelected.clear();
+    document.querySelectorAll('.msg-row.msg-selected').forEach(r => r.classList.remove('msg-selected'));
+    const bar = document.getElementById('msg-selection-bar');
+    if (bar) bar.hidden = true;
+  }
+
+  function updateMsgSelectionBar() {
+    const bar = document.getElementById('msg-selection-bar');
+    if (!bar) return;
+    const n = msgSelected.size;
+    bar.hidden = !msgSelectMode || n === 0;
+    const cnt = document.getElementById('msg-selection-count');
+    if (cnt) cnt.textContent = n + (n === 1 ? ' Selected' : ' Selected');
+  }
+
+  function enterMsgSelectMode(msgId, row) {
+    msgSelectMode = true;
+    msgSelected.clear();
+    msgSelected.add(String(msgId));
+    document.querySelectorAll('.msg-row.msg-selected').forEach(r => r.classList.remove('msg-selected'));
+    if (row) row.classList.add('msg-selected');
+    document.getElementById('reply-bar').hidden = true;
+    updateMsgSelectionBar();
+  }
+
   function renderChatList() {
+    syncSidebarChrome();
     const list = document.getElementById('chat-list');
     list.innerHTML = '';
     const archivedCount = allChats.filter(c => c.archived).length;
@@ -837,6 +958,7 @@
 
   function showChatListContextMenu(x, y, chat, el) {
     showContextMenu(x, y, [
+      { label: 'Close chat', action: () => { if (currentChat && String(currentChat.id) === String(chat.id)) { currentChat = null; document.getElementById('chat-header').style.display = 'none'; document.getElementById('message-scroll').innerHTML = ''; setRightPanePlaceholder(currentNavScreen === 'chats' ? 'default' : currentNavScreen); } } },
       { label: 'Open in new window', action: () => showPlaceholderToast('Open in new window (archive preview only)') },
       { label: 'Mark as unread', action: () => { Session.setChat(chat, { unseen_count: Math.max(1, chat.unseen_count || 0) }); loadChats(); } },
       { label: 'Archive chat', action: () => { Session.setChat(chat, { archived: true }); loadChats(); } },
@@ -877,6 +999,12 @@
     el.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
     closeChatInfo();
     closeCommunityPanel();
+    clearMsgSelection();
+    ['updates', 'calls', 'media'].forEach(m => {
+      const ph = document.getElementById('pane-placeholder-' + m);
+      if (ph) ph.hidden = true;
+    });
+    document.getElementById('message-scroll').style.display = '';
     currentChat = chat;
     msgList = [];
     noMoreOlder = false;
@@ -1020,8 +1148,14 @@
         else noMoreNewer = true;
         return;
       }
-      if (direction === 'older' && msgs.length < 50 && !params.has('before')) {
+      // Only stop when a paginated request (before/after cursor) returns a short page.
+      // Initial load may return fewer than limit from recent_messages cache (e.g. 49) but
+      // thousands of older rows still exist in msgstore.
+      if (direction === 'older' && msgs.length < 50 && params.has('before')) {
         noMoreOlder = true;
+      }
+      if (direction === 'newer' && msgs.length < 50 && params.has('after')) {
+        noMoreNewer = true;
       }
 
       suppressScroll = true;
@@ -1617,7 +1751,8 @@
       e.preventDefault();
       contextMsg = msg;
       showContextMenu(e.clientX, e.clientY, [
-        { label: 'Reply', action: () => openReplyBar(msg) },
+        { label: 'Reply', primary: true, action: () => openReplyBar(msg) },
+        { label: 'Reply privately', action: () => showPlaceholderToast('Reply privately (preview)') },
         { label: 'React', action: () => openEmojiPicker(e.clientX, e.clientY, msg) },
         { label: Session.msg(msg.msg_id).starred ? 'Unstar' : 'Star', action: () => {
           Session.setMsg(msg.msg_id, { starred: !Session.msg(msg.msg_id).starred });
@@ -1638,8 +1773,23 @@
           Session.setMsg(msg.msg_id, { deleted: true });
           renderWindow();
         }},
-        { label: 'Select messages', action: () => showPlaceholderToast('Select messages (preview)') },
+        { label: 'Select messages', action: () => enterMsgSelectMode(msg.msg_id, row) },
       ]);
+    });
+    row.addEventListener('click', e => {
+      if (!msgSelectMode) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const id = String(msg.msg_id);
+      if (msgSelected.has(id)) {
+        msgSelected.delete(id);
+        row.classList.remove('msg-selected');
+      } else {
+        msgSelected.add(id);
+        row.classList.add('msg-selected');
+      }
+      if (msgSelected.size === 0) clearMsgSelection();
+      else updateMsgSelectionBar();
     });
   }
 
@@ -1684,50 +1834,12 @@
   }
 
   async function openCommunityPanel(communityId) {
-    const panel = document.getElementById('community-panel');
-    const body = document.getElementById('community-panel-body');
-    const title = document.getElementById('community-panel-title');
-    document.getElementById('chat-header').style.display = 'flex';
-    document.getElementById('empty-pane').style.display = 'none';
-    document.getElementById('message-scroll').style.display = 'none';
-    panel.hidden = false;
-    title.textContent = 'Loading…';
-    body.innerHTML = '<div class="chat-info-row">Loading community…</div>';
-    const res = await fetch('/api/community/' + encodeURIComponent(communityId));
-    if (!res.ok) {
-      body.textContent = 'Community not found in backup.';
+    if (currentNavScreen === 'communities' || currentNavScreen === 'community-detail') {
+      await openCommunityDetailSidebar(communityId);
       return;
     }
-    const data = await res.json();
-    title.textContent = data.name || 'Community';
-    body.innerHTML = '';
-    const ann = document.createElement('div');
-    ann.className = 'community-announce-row';
-    ann.innerHTML = '<div class="community-megaphone">📢</div><div><div style="font-weight:600">Announcements</div><div style="font-size:12px;color:var(--text-muted)">Community updates</div></div>';
-    ann.addEventListener('click', () => {
-      const chat = allChats.find(c => String(c.id) === String(communityId) && c.type === 'group');
-      if (chat) {
-        closeCommunityPanel();
-        const el = document.querySelector(`.chat-item[data-id="${chat.id}"][data-type="group"]`);
-        selectChat(chat, el || document.createElement('div'));
-      }
-    });
-    body.appendChild(ann);
-    if (data.groups_youre_in && data.groups_youre_in.length) {
-      body.appendChild(Object.assign(document.createElement('div'), { className: 'community-section-title', textContent: "Groups you're in" }));
-      data.groups_youre_in.forEach(g => body.appendChild(communityGroupRow(g, () => openCommunityGroupChat(g))));
-    }
-    if (data.groups_you_can_join && data.groups_you_can_join.length) {
-      body.appendChild(Object.assign(document.createElement('div'), { className: 'community-section-title', textContent: 'Groups you can join' }));
-      data.groups_you_can_join.forEach(g => body.appendChild(communityGroupRow(g, () => showPlaceholderToast('Join group (archive preview only)'))));
-    }
-    const info = document.createElement('button');
-    info.type = 'button';
-    info.className = 'chat-info-link';
-    info.style.margin = '16px';
-    info.textContent = 'Community info · ' + (data.group_count || 0) + ' groups';
-    info.addEventListener('click', () => showCommunityInfoSheet(data));
-    body.appendChild(info);
+    showCommunitiesNav();
+    await openCommunityDetailSidebar(communityId);
   }
 
   function communityGroupRow(g, onClick) {
@@ -1778,45 +1890,138 @@
     panel.classList.add('open');
   }
 
-  async function loadCommunityNavList() {
-    const list = document.getElementById('community-list');
-    list.innerHTML = '<div id="chat-list-notice">Loading…</div>';
-    const res = await fetch('/api/communities');
-    const items = await res.json();
+  function communityPreviewRow(label, preview, when, extraClass, onClick) {
+    const row = document.createElement('div');
+    row.className = 'community-card-row' + (extraClass ? ' ' + extraClass : '');
+    row.innerHTML = `<div class="community-card-row-label">${esc(label)}</div><div class="community-card-row-meta"><span class="community-card-row-preview">${preview}</span><span class="community-card-row-when">${esc(when || '')}</span></div>`;
+    if (onClick) row.addEventListener('click', onClick);
+    return row;
+  }
+
+  async function loadCommunityCards() {
+    const list = document.getElementById('community-cards-list');
+    if (!list) return;
+    list.innerHTML = '<div id="chat-list-notice">Loading communities…</div>';
+    const communities = await fetch('/api/communities').then(r => r.json()).catch(() => []);
+    const details = await Promise.all(communities.map(c =>
+      fetch('/api/community/' + encodeURIComponent(c.id)).then(r => r.ok ? r.json() : null).catch(() => null)));
     list.innerHTML = '';
-    items.forEach(c => {
-      const row = document.createElement('div');
-      row.className = 'chat-item community-row';
+    communities.forEach((c, i) => {
+      const data = details[i];
+      if (!data) return;
+      const card = document.createElement('div');
+      card.className = 'community-card';
       const name = prettyLabel(c.display_name) || c.display_name;
-      row.innerHTML = avatarHtml(name, true, c) +
-        `<div class="chat-body"><div class="chat-top"><div class="chat-name">${esc(name)}</div></div><div class="chat-meta-row"><div class="chat-meta">Community</div></div></div>`;
-      row.addEventListener('click', () => {
-        showChatsNav();
-        openCommunityPanel(c.id);
+      const head = document.createElement('div');
+      head.className = 'community-card-head';
+      head.innerHTML = avatarHtml(name, true, c) + `<span class="community-card-name">${esc(name)}</span>`;
+      head.addEventListener('click', () => openCommunityDetailSidebar(c.id));
+      card.appendChild(head);
+      const rows = document.createElement('div');
+      rows.className = 'community-card-rows';
+      const ann = allChats.find(ch => String(ch.id) === String(c.id));
+      rows.appendChild(communityPreviewRow('📢 Announcements', ann ? chatPreview(ann) : 'Community updates', ann ? fmtListWhen(ann.newest_ts) : '', 'announcements', () => openCommunityAnnouncements(c.id)));
+      (data.groups_youre_in || []).slice(0, 4).forEach(g => {
+        const gc = allChats.find(ch => String(ch.id) === String(g.id));
+        const gname = prettyLabel(g.display_name) || g.display_name;
+        rows.appendChild(communityPreviewRow(gname, gc ? chatPreview(gc) : '', gc ? fmtListWhen(gc.newest_ts) : '', '', () => openCommunityGroupChat(g)));
       });
-      list.appendChild(row);
+      card.appendChild(rows);
+      const see = document.createElement('button');
+      see.type = 'button';
+      see.className = 'community-card-see-all';
+      see.textContent = 'See all ›';
+      see.addEventListener('click', () => openCommunityDetailSidebar(c.id));
+      card.appendChild(see);
+      list.appendChild(card);
     });
+  }
+
+  function fillCommunityDetailBody(data, communityId) {
+    const body = document.getElementById('community-detail-body');
+    if (!body) return;
+    body.innerHTML = '';
+    const ann = document.createElement('div');
+    ann.className = 'community-announce-row';
+    ann.innerHTML = '<div class="community-megaphone">📢</div><div><div style="font-weight:600">Announcements</div><div style="font-size:12px;color:var(--text-muted)">Community updates</div></div>';
+    ann.addEventListener('click', () => openCommunityAnnouncements(communityId));
+    body.appendChild(ann);
+    if (data.groups_youre_in && data.groups_youre_in.length) {
+      body.appendChild(Object.assign(document.createElement('div'), { className: 'community-section-title', textContent: "Groups you're in" }));
+      data.groups_youre_in.forEach(g => body.appendChild(communityGroupRow(g, () => openCommunityGroupChat(g))));
+    }
+    if (data.groups_you_can_join && data.groups_you_can_join.length) {
+      body.appendChild(Object.assign(document.createElement('div'), { className: 'community-section-title', textContent: 'Groups you can join' }));
+      data.groups_you_can_join.forEach(g => body.appendChild(communityGroupRow(g, () => showPlaceholderToast('Join group (archive preview only)'))));
+    }
+  }
+
+  async function openCommunityDetailSidebar(communityId) {
+    currentNavScreen = 'community-detail';
+    hideAllSidebarPanels();
+    document.getElementById('community-detail-panel').hidden = false;
+    document.getElementById('sidebar-filters').style.display = 'none';
+    document.getElementById('search-box').style.display = 'none';
+    syncSidebarChrome();
+    const nameEl = document.getElementById('community-detail-name');
+    if (nameEl) nameEl.textContent = 'Loading…';
+    document.getElementById('community-detail-body').innerHTML = '<div class="chat-info-row">Loading…</div>';
+    closeCommunityPanel();
+    currentChat = null;
+    document.getElementById('chat-header').style.display = 'none';
+    document.getElementById('message-scroll').style.display = 'none';
+    setRightPanePlaceholder('default');
+    const res = await fetch('/api/community/' + encodeURIComponent(communityId));
+    if (!res.ok) {
+      document.getElementById('community-detail-body').textContent = 'Community not found in backup.';
+      return;
+    }
+    const data = await res.json();
+    if (nameEl) nameEl.textContent = data.name || 'Community';
+    fillCommunityDetailBody(data, communityId);
+  }
+
+  function openCommunityAnnouncements(communityId) {
+    const chat = allChats.find(c => String(c.id) === String(communityId) && c.type === 'group');
+    if (!chat) return;
+    const el = document.querySelector(`.chat-item[data-id="${chat.id}"][data-type="group"]`) || document.createElement('div');
+    selectChat(chat, el);
+  }
+
+  function loadCallsScreen() {
+    const fav = document.getElementById('calls-favourites');
+    const recent = document.getElementById('calls-recent-list');
+    if (!fav || !recent) return;
+    fav.innerHTML = '';
+    const favourites = allChats.filter(c => c.is_favorite && !c.archived);
+    if (!favourites.length) fav.innerHTML = '<p class="nav-screen-muted pad">No favourite contacts in backup.</p>';
+    favourites.forEach(c => {
+      const row = document.createElement('div');
+      row.className = 'calls-fav-item';
+      row.textContent = prettyLabel(c.display_name) || c.id;
+      fav.appendChild(row);
+    });
+    recent.innerHTML = '<p class="nav-screen-muted pad">Recent calls list uses call_log — not wired in viewer yet.</p>';
+  }
+
+  function loadMediaScreen() {
+    const grid = document.getElementById('media-global-grid');
+    const stats = document.getElementById('media-global-stats');
+    if (!grid) return;
+    grid.innerHTML = '<p class="nav-screen-muted pad">Global media grid requires a cross-chat index — open Media from a chat for now.</p>';
+    if (stats) stats.textContent = '';
   }
 
   function showCommunitiesNav() {
     document.querySelectorAll('.nav-rail-btn').forEach(b => b.classList.toggle('active', b.dataset.nav === 'communities'));
-    const t = document.getElementById('sidebar-title');
-    if (t) t.textContent = 'Communities';
-    document.getElementById('community-list-panel').hidden = false;
-    document.getElementById('chat-list').style.display = 'none';
-    document.getElementById('sidebar-filters').style.display = 'none';
-    document.getElementById('search-box').style.display = 'none';
-    loadCommunityNavList();
+    showingArchived = false;
+    showingStarred = false;
+    enterNavScreen('communities');
   }
 
   function showChatsNav() {
     document.querySelectorAll('.nav-rail-btn').forEach(b => b.classList.toggle('active', b.dataset.nav === 'chats'));
-    const t = document.getElementById('sidebar-title');
-    if (t) t.textContent = 'Chats';
-    document.getElementById('community-list-panel').hidden = true;
-    document.getElementById('chat-list').style.display = '';
-    document.getElementById('sidebar-filters').style.display = '';
-    document.getElementById('search-box').style.display = '';
+    enterNavScreen('chats');
   }
 
   function renderMedia(msg) {
@@ -4060,7 +4265,18 @@
   }
 
   document.getElementById('community-panel-back')?.addEventListener('click', closeCommunityPanel);
-  document.getElementById('community-list-back')?.addEventListener('click', showChatsNav);
+
+  document.getElementById('msg-selection-close')?.addEventListener('click', clearMsgSelection);
+  document.getElementById('msg-sel-delete')?.addEventListener('click', () => {
+    msgSelected.forEach(id => Session.setMsg(id, { deleted: true }));
+    clearMsgSelection();
+    renderWindow();
+  });
+  document.getElementById('msg-sel-star')?.addEventListener('click', () => {
+    msgSelected.forEach(id => Session.setMsg(id, { starred: true }));
+    clearMsgSelection();
+    renderWindow();
+  });
   document.getElementById('reset-session-btn')?.addEventListener('click', () => {
     if (!confirm('Reset all interactive changes (replies, reactions, session pins, archive toggles)? Your msgstore backup on disk is never modified — only browser session state is cleared.')) return;
     Session.reset();
@@ -4071,6 +4287,9 @@
       const nav = btn.dataset.nav;
       if (nav === 'chats') { showChatsNav(); showingArchived = false; showingStarred = false; renderChatList(); }
       else if (nav === 'communities') showCommunitiesNav();
+      else if (nav === 'updates') { document.querySelectorAll('.nav-rail-btn').forEach(b => b.classList.toggle('active', b.dataset.nav === 'updates')); enterNavScreen('updates'); }
+      else if (nav === 'calls') { document.querySelectorAll('.nav-rail-btn').forEach(b => b.classList.toggle('active', b.dataset.nav === 'calls')); enterNavScreen('calls'); }
+      else if (nav === 'media') { document.querySelectorAll('.nav-rail-btn').forEach(b => b.classList.toggle('active', b.dataset.nav === 'media')); enterNavScreen('media'); }
       else if (nav === 'archived') {
         showChatsNav();
         showingArchived = true;
@@ -4082,6 +4301,7 @@
         openStarredList();
       }
       else if (nav === 'settings') document.getElementById('settings-btn').click();
+      else if (nav === 'meta-ai') showPlaceholderToast('Meta AI (archive preview — open Meta AI chat in backup if present)');
       else showPlaceholderToast(nav.replace('-', ' ') + ' (archive preview)');
     });
   });

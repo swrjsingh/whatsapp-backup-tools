@@ -131,6 +131,7 @@ Known **backup gaps** (show on Desktop, weak/no node rows): e.g. some SIH / IEEE
 
 - Serve media from archived paths when files exist; honest missing-file state when not (~2,786 DB paths without files).
 - **Most profile photos** are **not** in backup (app-private avatars) — do not invent; use DB JPEGs where stored (group photo-change, copied profile photo folder).
+- **Viewer reads PfPs only from `<archive>/`** (`Media/WhatsApp Profile Photos`, `viewer-assets/*`). To add icons from phone media or a **one-time** Desktop export, run `scripts/ingest-viewer-assets.py` — the running app must **not** read live Desktop or sibling `phone-copy` paths.
 
 ### Menus
 

@@ -171,6 +171,16 @@ HTML_TEMPLATE = (
         <div id="community-panel-body"></div>
       </div>
       <div id="message-scroll"></div>
+      <div id="msg-selection-bar" hidden>
+        <button type="button" id="msg-selection-close" class="msg-sel-close" title="Cancel selection">&#10005;</button>
+        <span id="msg-selection-count">0 Selected</span>
+        <div class="msg-selection-actions">
+          <button type="button" class="msg-sel-btn wa-placeholder-btn" data-placeholder="sel-reply" title="Reply">&#8617;</button>
+          <button type="button" class="msg-sel-btn" id="msg-sel-star" title="Star">&#9734;</button>
+          <button type="button" class="msg-sel-btn wa-placeholder-btn" data-placeholder="sel-forward" title="Forward">&#10140;</button>
+          <button type="button" class="msg-sel-btn" id="msg-sel-delete" title="Delete">&#128465;</button>
+        </div>
+      </div>
       <div id="reply-bar" hidden>
         <div id="reply-bar-preview"></div>
         <input id="reply-bar-input" type="text" placeholder="Type a reply…" autocomplete="off">

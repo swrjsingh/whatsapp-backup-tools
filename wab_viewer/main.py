@@ -1814,7 +1814,16 @@ _IOS_IS_DOCUMENT_UNDOWNLOADED = (
 def _android_chat_filter(chat_id: str, chat_type: str) -> tuple[str, list]:
     if chat_type == "group":
         return "m.chat_row_id = CAST(? AS INTEGER)", [chat_id]
-    return "j_chat.user = ?", [chat_id]
+    # EXISTS works for message-only queries (recent_messages cache) and full SELECT (j_chat joined).
+    return (
+        "EXISTS (SELECT 1 FROM chat c "
+        "JOIN jid j_chat ON j_chat._id = c.jid_row_id "
+        "LEFT JOIN _jid_map_resolved jm ON jm.lid_row_id = c.jid_row_id "
+        "LEFT JOIN jid j_real ON j_real._id = jm.jid_row_id "
+        "WHERE c._id = m.chat_row_id "
+        "AND COALESCE(j_real.user, j_chat.user) = ?)",
+        [chat_id],
+    )
 
 
 _COMMUNITY_LINK_ACTIONS = frozenset({108, 110, 126, 127, 128, 149, 116, 171, 102, 104, 113})
@@ -2110,23 +2119,133 @@ def _list_open_communities(conn: sqlite3.Connection) -> list:
 
 
 def _contact_profile_photos(output_root: Path) -> dict[str, Path]:
-    """Phone numbers to profile-photo files copied with the WhatsApp media."""
-    photos: dict[str, Path] = {}
-    folders = (
-        output_root.parent / "phone-copy" / "WhatsApp" / "Media" / "WhatsApp Profile Photos",
-        output_root / "Media" / "WhatsApp Profile Photos",
-    )
-    for folder in folders:
-        if not folder.is_dir():
+    """Phone digits to profile-photo files stored under output_root (see archive_assets)."""
+    from wab_viewer.archive_assets import contact_profile_photos
+
+    return contact_profile_photos(output_root)
+
+
+def _group_avatar_jpeg_blob(conn: sqlite3.Connection, chat_row_id: int) -> bytes | None:
+    """Inline JPEG from message_system_photo_change (new or old blob, newest first)."""
+    rows = conn.execute(
+        """
+        SELECT p.new_photo, p.old_photo
+        FROM message_system_photo_change p
+        JOIN message m ON m._id = p.message_row_id
+        WHERE m.chat_row_id = ?
+        ORDER BY m.timestamp DESC
+        """,
+        (chat_row_id,),
+    ).fetchall()
+    for new_photo, old_photo in rows:
+        for blob in (new_photo, old_photo):
+            if blob and len(blob) > 100:
+                return blob
+    return None
+
+
+def _chat_jid_user(conn: sqlite3.Connection, chat_row_id: int) -> str | None:
+    """Return jid.user for a chat row, or None."""
+    row = conn.execute(
+        """
+        SELECT j.user FROM chat c
+        JOIN jid j ON j._id = c.jid_row_id
+        WHERE c._id = ?
+        """,
+        (chat_row_id,),
+    ).fetchone()
+    if not row or not row[0]:
+        return None
+    return str(row[0]).strip() or None
+
+
+def _related_group_avatar_chat_ids(conn: sqlite3.Connection, chat_row_id: int) -> list[int]:
+    """Other chat rows that may share the same profile icon (community shell, duplicate subject)."""
+    order: list[int] = [chat_row_id]
+    seen = {chat_row_id}
+    row = conn.execute(
+        "SELECT subject, group_type FROM chat WHERE _id = ?",
+        (chat_row_id,),
+    ).fetchone()
+    if row and row[0]:
+        subj = str(row[0]).strip()
+        if subj:
+            for r in conn.execute(
+                "SELECT _id FROM chat WHERE subject = ? AND hidden = 0",
+                (subj,),
+            ):
+                cid = int(r[0])
+                if cid not in seen:
+                    seen.add(cid)
+                    order.append(cid)
+    gt = int(row[1] or 0) if row else 0
+    if gt == 3:
+        for child in _community_child_buckets(conn, chat_row_id).get("groups_youre_in", []):
+            cid = int(child["id"])
+            if cid not in seen:
+                seen.add(cid)
+                order.append(cid)
+    return order
+
+
+def _resolve_group_avatar(
+    conn: sqlite3.Connection,
+    output_root: Path,
+    chat_row_id: int,
+):
+    """Return ('blob', bytes) or ('file', Path) for a group/community chat icon."""
+    from wab_viewer.archive_assets import group_avatar_by_jid_file, group_avatar_file
+
+    for cid in _related_group_avatar_chat_ids(conn, chat_row_id):
+        blob = _group_avatar_jpeg_blob(conn, cid)
+        if blob:
+            return ("blob", blob)
+        path = group_avatar_file(output_root, cid)
+        if path is not None:
+            return ("file", path)
+        jid_user = _chat_jid_user(conn, cid)
+        if jid_user:
+            path = group_avatar_by_jid_file(output_root, jid_user)
+            if path is not None:
+                return ("file", path)
+    return None
+
+
+def _chats_with_avatar_blobs(conn: sqlite3.Connection) -> set[int]:
+    rows = conn.execute(
+        """
+        SELECT DISTINCT m.chat_row_id
+        FROM message_system_photo_change p
+        JOIN message m ON m._id = p.message_row_id
+        WHERE (p.new_photo IS NOT NULL AND length(p.new_photo) > 100)
+           OR (p.old_photo IS NOT NULL AND length(p.old_photo) > 100)
+        """
+    ).fetchall()
+    return {int(r[0]) for r in rows}
+
+
+def _apply_has_avatar_flags(
+    conn: sqlite3.Connection,
+    chats: list[dict],
+    output_root: Path,
+) -> None:
+    """Avatar only from msgstore JPEG blobs or files copied into output_root."""
+    contact_files = _contact_profile_photos(output_root)
+    group_avatar_cache: dict[int, bool] = {}
+    for d in chats:
+        d["has_avatar"] = 0
+        cid = str(d.get("id") or "")
+        if not cid.isdigit():
             continue
-        for path in folder.iterdir():
-            if not path.is_file():
-                continue
-            matched = re.search(r"(\d[\d\s]{6,22}?)\s+\d{8}", path.name)
-            digits = re.sub(r"\D", "", matched.group(1) if matched else path.stem)
-            if 8 <= len(digits) <= 15:
-                photos.setdefault(digits, path)
-    return photos
+        chat_int = int(cid)
+        if d.get("type") == "group":
+            if chat_int not in group_avatar_cache:
+                group_avatar_cache[chat_int] = _resolve_group_avatar(conn, output_root, chat_int) is not None
+            d["has_avatar"] = 1 if group_avatar_cache[chat_int] else 0
+        elif d.get("type") == "contact":
+            digits = re.sub(r"\D", "", cid)
+            if digits in contact_files:
+                d["has_avatar"] = 1
 
 
 def _apply_message_cards(conn: sqlite3.Connection, rows: list) -> None:
@@ -2239,7 +2358,7 @@ def _apply_message_cards(conn: sqlite3.Connection, rows: list) -> None:
             continue
         if meta["from_me"]:
             status = meta["status"]
-            if status in (8, 13):
+            if status in (6, 8, 13):
                 row["receipt"] = "read"
             elif status == 5:
                 row["receipt"] = "delivered"
@@ -3815,18 +3934,7 @@ def create_app(output_root: Path, rescan: bool = False):
             d["has_avatar"] = 0
             result.append(d)
         if source_type == "android" and result:
-            group_ids = {
-                str(r[0])
-                for r in conn.execute(
-                    """
-                    SELECT DISTINCT m.chat_row_id
-                    FROM message_system_photo_change p
-                    JOIN message m ON m._id = p.message_row_id
-                    WHERE p.new_photo IS NOT NULL AND length(p.new_photo) > 100
-                    """
-                )
-            }
-            contact_ids = set(_contact_profile_photos(output_root))
+            _apply_has_avatar_flags(conn, result, output_root)
             favorite_ids = _favorite_contact_ids(conn)
             pinned_order = _resolve_pinned_chat_ids(conn)
             pinned_set = set(pinned_order)
@@ -3842,10 +3950,6 @@ def create_app(output_root: Path, rescan: bool = False):
                 )
             }
             for d in result:
-                if d.get("type") == "group" and str(d.get("id")) in group_ids:
-                    d["has_avatar"] = 1
-                elif d.get("type") == "contact" and re.sub(r"\D", "", str(d.get("id") or "")) in contact_ids:
-                    d["has_avatar"] = 1
                 cid = str(d.get("id") or "")
                 d["is_favorite"] = 1 if (
                     d.get("type") == "contact" and cid in favorite_ids
@@ -4398,10 +4502,11 @@ def create_app(output_root: Path, rescan: bool = False):
         if conn is None or source_type != "android":
             return jsonify([])
         items = _list_open_communities(conn)
+        blob_chats = _chats_with_avatar_blobs(conn)
         for item in items:
             cid = item["id"]
-            item["has_avatar"] = 0
             item["type"] = "community"
+            item["has_avatar"] = 1 if str(cid).isdigit() and int(cid) in blob_chats else 0
             buckets = _community_child_buckets(conn, int(cid))
             item["groups_in_count"] = len(buckets["groups_youre_in"]) + len(
                 buckets["groups_you_can_join"]
@@ -4652,23 +4757,17 @@ def create_app(output_root: Path, rescan: bool = False):
         chat_type = request.args.get("chat_type", "")
         conn = get_wa()
         if conn is not None and chat_type == "group" and chat_id.isdigit():
-            row = conn.execute(
-                """
-                SELECT p.new_photo
-                FROM message_system_photo_change p
-                JOIN message m ON m._id = p.message_row_id
-                WHERE m.chat_row_id = ?
-                  AND p.new_photo IS NOT NULL AND length(p.new_photo) > 100
-                ORDER BY m.timestamp DESC
-                LIMIT 1
-                """,
-                (int(chat_id),),
-            ).fetchone()
-            if row and row[0]:
-                return Response(row[0], mimetype="image/jpeg")
-        photo = _contact_profile_photos(output_root).get(re.sub(r"\D", "", chat_id))
-        if photo is not None:
-            return send_from_directory(photo.parent, photo.name)
+            resolved = _resolve_group_avatar(conn, output_root, int(chat_id))
+            if resolved:
+                kind, payload = resolved
+                if kind == "blob":
+                    return Response(payload, mimetype="image/jpeg")
+                return send_from_directory(payload.parent, payload.name)
+        elif chat_type == "contact":
+            digits = re.sub(r"\D", "", chat_id)
+            photo = _contact_profile_photos(output_root).get(digits)
+            if photo is not None:
+                return send_from_directory(photo.parent, photo.name)
         return ("", 404)
 
     @app.route("/api/link-thumb/<int:message_id>")
