@@ -1,0 +1,24 @@
+WhatsApp Desktop 2.26.41.28 — UI ground truth (read-only reference screenshots)
+Saved under: logs/ui-compare/desktop-2.26.41.28/
+Use with INTENT.md §3 and FEATURES.md when implementing clone parity.
+
+00-chats-empty-pane.png       — Chats selected; no chat open; empty right pane + list
+00-chats-group-thread.jpg     — Group chat open (IEEE CompSoc); bubbles, wallpaper, header
+01-nav-updates.png            — Updates tab; Status tray, Channels, Find channels; right “My status”
+02-nav-communities-cards.png  — Communities tab; stacked community cards (IEEE, S1+S2 CSE); See all
+03-nav-calls.png              — Calls tab; Favourites, Recent, 2×2 action grid on right
+04-nav-media-grid.jpg         — Media tab; Media/Links/Docs tabs; global media grid + counts
+05-nav-meta-ai-chat.jpg       — Meta AI 1:1 thread (placeholder content; do not send)
+06-more-archived-list.png     — More → Archived; title Archived + Edit; list + empty right
+07-more-starred-list.png      — More → Starred; search; starred message previews + chevrons
+08-community-devs-dungeon-pane.png — Community middle pane; groups you can join; + Add group
+09-community-code-red-pane.png — Community middle pane; groups in + can join
+10-community-join-group-modal.png — Join group preview modal (General); read-only in archive
+11-community-subgroup-chat.jpg — Subgroup chat open while community pane visible left
+12-community-announcements-thread.jpg — Announcements chat; admin-only banner; no composer
+13-community-info-announcements-tab.jpg — Community info modal; Announcements tab
+14-community-info-community-tab.jpg — Community info modal; Community tab; members
+15-community-view-groups-overlay.png — View groups full list overlay from community
+
+Cursor chat assets (original uploads, same bytes as above where copied):
+  ~/.cursor/projects/.../assets/image-*.png|jpg — ephemeral; repo copies are canonical.

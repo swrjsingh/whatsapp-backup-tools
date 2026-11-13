@@ -1661,6 +1661,7 @@ _ANDROID_FILTER = """
         OR (m.message_type IS NOT NULL AND m.message_type != 0 AND m.message_type != 7 AND mm.file_path IS NOT NULL)
         OR (m.message_type IN (4, 14))
         OR (m.message_type = 7)
+        OR (m.message_type = 66)
     )
 """
 
@@ -1814,6 +1815,575 @@ def _android_chat_filter(chat_id: str, chat_type: str) -> tuple[str, list]:
     if chat_type == "group":
         return "m.chat_row_id = CAST(? AS INTEGER)", [chat_id]
     return "j_chat.user = ?", [chat_id]
+
+
+_COMMUNITY_LINK_ACTIONS = frozenset({108, 110, 126, 127, 128, 149, 116, 171, 102, 104, 113})
+_COMMUNITY_UNLINK_ACTIONS = frozenset({109, 111})
+
+# Pinned chats: not stored in Android msgstore; resolved once from subjects at runtime.
+_PINNED_CHAT_SUBJECTS = (
+    "IEEE CompSoc Core 2026/27",
+    "S1+S2 ವಿಧಾನ ಸೌಧ",
+    "S1+S2 CSE",
+)
+
+
+def _android_has_table(conn: sqlite3.Connection, name: str) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (name,),
+        ).fetchone()
+        is not None
+    )
+
+
+def _resolve_pinned_chat_ids(conn: sqlite3.Connection) -> list[str]:
+    """Return pinned chat ids in display order (group chat._id as text)."""
+    ordered: list[str] = []
+    for subject in _PINNED_CHAT_SUBJECTS:
+        row = conn.execute(
+            """
+            SELECT CAST(c._id AS TEXT) AS id
+            FROM chat c
+            WHERE c.hidden = 0
+              AND c.subject = ?
+            ORDER BY CASE c.group_type WHEN 3 THEN 0 WHEN 2 THEN 1 ELSE 2 END, c._id
+            LIMIT 1
+            """,
+            (subject,),
+        ).fetchone()
+        if row:
+            ordered.append(row["id"])
+    return ordered
+
+
+def _favorite_contact_ids(conn: sqlite3.Connection) -> set[str]:
+    if not _android_has_table(conn, "favorite"):
+        return set()
+    rows = conn.execute(
+        """
+        SELECT COALESCE(j.user, CAST(c._id AS TEXT)) AS chat_id
+        FROM favorite f
+        LEFT JOIN jid j ON j._id = f.jid_row_id
+        LEFT JOIN chat c ON c.jid_row_id = f.jid_row_id
+        WHERE j.server = 's.whatsapp.net' OR c._id IS NOT NULL
+        """
+    ).fetchall()
+    out: set[str] = set()
+    for r in rows:
+        if r["chat_id"]:
+            out.add(str(r["chat_id"]))
+    return out
+
+
+def _type3_for_subject(conn: sqlite3.Connection, subject: str) -> int | None:
+    row = conn.execute(
+        """
+        SELECT c._id FROM chat c
+        JOIN community_chat cc ON cc.chat_row_id = c._id
+        WHERE c.hidden = 0 AND c.group_type = 3 AND c.subject = ? AND cc.closed = 0
+        LIMIT 1
+        """,
+        (subject,),
+    ).fetchone()
+    return int(row[0]) if row else None
+
+
+def _community_type1_twin(conn: sqlite3.Connection, type3_id: int) -> int | None:
+    row = conn.execute(
+        "SELECT subject FROM chat WHERE _id = ?",
+        (type3_id,),
+    ).fetchone()
+    if not row or not row[0]:
+        return None
+    twin = conn.execute(
+        """
+        SELECT _id FROM chat
+        WHERE hidden = 0 AND group_type = 1 AND subject = ?
+        LIMIT 1
+        """,
+        (row[0],),
+    ).fetchone()
+    return int(twin[0]) if twin else None
+
+
+def _latest_community_child_links(conn: sqlite3.Connection, parent_chat_ids: list[int]) -> list:
+    if not parent_chat_ids or not _android_has_table(conn, "message_system_with_group_nodes"):
+        return []
+    ph = ",".join("?" * len(parent_chat_ids))
+    return conn.execute(
+        f"""
+        WITH edges AS (
+            SELECT m.chat_row_id AS src_chat,
+                   tc._id AS child_id,
+                   tc.subject AS child_subject,
+                   tc.group_type AS child_group_type,
+                   tc.hidden AS child_hidden,
+                   tc.unseen_message_count AS child_unseen,
+                   tc.sort_timestamp AS child_sort_ts,
+                   ms.action_type AS action_type,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY m.chat_row_id, tc._id
+                       ORDER BY m.timestamp DESC, m._id DESC
+                   ) AS rn
+            FROM message_system_with_group_nodes n
+            JOIN message m ON m._id = n.message_row_id
+            JOIN message_system ms ON ms.message_row_id = m._id
+            JOIN jid j ON j._id = n.group_jid_row_id
+            LEFT JOIN chat tc ON tc.jid_row_id = j._id
+            WHERE m.chat_row_id IN ({ph})
+              AND n.group_node_type = 2
+              AND tc._id IS NOT NULL
+        )
+        SELECT * FROM edges WHERE rn = 1
+        """,
+        parent_chat_ids,
+    ).fetchall()
+
+
+def _community_child_buckets(conn: sqlite3.Connection, community_id: int) -> dict:
+    twin = _community_type1_twin(conn, community_id)
+    parent_ids = [community_id] + ([twin] if twin else [])
+    rows = _latest_community_child_links(conn, parent_ids)
+    youre_in = []
+    can_join = []
+    seen: set[int] = set()
+    for r in rows:
+        if r["action_type"] in _COMMUNITY_UNLINK_ACTIONS:
+            continue
+        if r["action_type"] not in _COMMUNITY_LINK_ACTIONS:
+            continue
+        cid = r["child_id"]
+        if cid in seen or r["child_hidden"]:
+            continue
+        seen.add(cid)
+        subject = (r["child_subject"] or "").strip()
+        if not subject:
+            continue
+        gt = r["child_group_type"] or 0
+        entry = {
+            "id": str(cid),
+            "type": "group",
+            "display_name": subject,
+            "group_type": gt,
+            "unseen_count": r["child_unseen"] or 0,
+            "newest_ts": r["child_sort_ts"] or 0,
+        }
+        if gt in (2, 6):
+            youre_in.append(entry)
+        elif gt == 0:
+            can_join.append(entry)
+    youre_in.sort(key=lambda x: x.get("newest_ts") or 0, reverse=True)
+    can_join.sort(key=lambda x: x.get("display_name") or "")
+    return {"groups_youre_in": youre_in, "groups_you_can_join": can_join}
+
+
+def _community_for_subgroup(conn: sqlite3.Connection, subgroup_chat_id: str) -> dict | None:
+    if not subgroup_chat_id.isdigit():
+        return None
+    sg = int(subgroup_chat_id)
+    if not _android_has_table(conn, "message_system_with_group_nodes"):
+        return None
+    rows = conn.execute(
+        """
+        WITH edges AS (
+            SELECT m.chat_row_id AS src_chat,
+                   tc._id AS child_id,
+                   ms.action_type AS action_type,
+                   pc._id AS parent_id,
+                   pc.subject AS parent_subject,
+                   pc.group_type AS parent_group_type,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY tc._id, pc._id
+                       ORDER BY m.timestamp DESC, m._id DESC
+                   ) AS rn
+            FROM message_system_with_group_nodes n
+            JOIN message m ON m._id = n.message_row_id
+            JOIN message_system ms ON ms.message_row_id = m._id
+            JOIN jid j ON j._id = n.group_jid_row_id
+            JOIN chat tc ON tc.jid_row_id = j._id
+            JOIN chat pc ON pc._id = m.chat_row_id
+            WHERE n.group_node_type = 2
+              AND tc._id = ?
+              AND pc.group_type IN (1, 3)
+        )
+        SELECT * FROM edges WHERE rn = 1
+        """,
+        (sg,),
+    ).fetchall()
+    for r in rows:
+        if r["action_type"] in _COMMUNITY_UNLINK_ACTIONS:
+            continue
+        if r["action_type"] not in _COMMUNITY_LINK_ACTIONS:
+            continue
+        parent_id = r["parent_id"]
+        if r["parent_group_type"] == 1:
+            t3 = conn.execute(
+                """
+                SELECT c._id, c.subject FROM chat c
+                WHERE c.group_type = 3 AND c.subject = (
+                    SELECT subject FROM chat WHERE _id = ?
+                )
+                LIMIT 1
+                """,
+                (parent_id,),
+            ).fetchone()
+            if t3:
+                return {"community_id": str(t3[0]), "community_name": t3[1] or ""}
+        return {
+            "community_id": str(parent_id),
+            "community_name": r["parent_subject"] or "",
+        }
+    rows = conn.execute(
+        """
+        WITH edges AS (
+            SELECT m.chat_row_id AS src_chat,
+                   tc._id AS child_id,
+                   ms.action_type AS action_type,
+                   pc._id AS parent_id,
+                   pc.subject AS parent_subject,
+                   pc.group_type AS parent_group_type,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY tc._id
+                       ORDER BY m.timestamp DESC, m._id DESC
+                   ) AS rn
+            FROM message_system_with_group_nodes n
+            JOIN message m ON m._id = n.message_row_id
+            JOIN message_system ms ON ms.message_row_id = m._id
+            JOIN jid j ON j._id = n.group_jid_row_id
+            JOIN chat tc ON tc.jid_row_id = j._id
+            JOIN chat pc ON pc._id = m.chat_row_id
+            WHERE n.group_node_type = 1
+              AND tc._id = ?
+              AND pc.group_type IN (1, 3)
+        )
+        SELECT * FROM edges WHERE rn = 1
+        """,
+        (sg,),
+    ).fetchall()
+    for r in rows:
+        if r["action_type"] in _COMMUNITY_UNLINK_ACTIONS:
+            continue
+        if r["action_type"] not in _COMMUNITY_LINK_ACTIONS:
+            continue
+        parent_id = r["parent_id"]
+        if r["parent_group_type"] == 1:
+            t3 = conn.execute(
+                """
+                SELECT c._id, c.subject FROM chat c
+                WHERE c.group_type = 3 AND c.subject = (
+                    SELECT subject FROM chat WHERE _id = ?
+                )
+                LIMIT 1
+                """,
+                (parent_id,),
+            ).fetchone()
+            if t3:
+                return {"community_id": str(t3[0]), "community_name": t3[1] or ""}
+        return {
+            "community_id": str(parent_id),
+            "community_name": r["parent_subject"] or "",
+        }
+    return None
+
+
+def _list_open_communities(conn: sqlite3.Connection) -> list:
+    if not _android_has_table(conn, "community_chat"):
+        return []
+    rows = conn.execute(
+        """
+        SELECT CAST(c._id AS TEXT) AS id,
+               c.subject AS display_name,
+               c.sort_timestamp AS newest_ts,
+               IFNULL(c.unseen_message_count, 0) AS unseen_count
+        FROM community_chat cc
+        JOIN chat c ON c._id = cc.chat_row_id
+        WHERE cc.closed = 0
+          AND c.hidden = 0
+          AND c.group_type = 3
+          AND TRIM(IFNULL(c.subject, '')) != ''
+        ORDER BY c.sort_timestamp DESC
+        """
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def _contact_profile_photos(output_root: Path) -> dict[str, Path]:
+    """Phone numbers to profile-photo files copied with the WhatsApp media."""
+    photos: dict[str, Path] = {}
+    folders = (
+        output_root.parent / "phone-copy" / "WhatsApp" / "Media" / "WhatsApp Profile Photos",
+        output_root / "Media" / "WhatsApp Profile Photos",
+    )
+    for folder in folders:
+        if not folder.is_dir():
+            continue
+        for path in folder.iterdir():
+            if not path.is_file():
+                continue
+            matched = re.search(r"(\d[\d\s]{6,22}?)\s+\d{8}", path.name)
+            digits = re.sub(r"\D", "", matched.group(1) if matched else path.stem)
+            if 8 <= len(digits) <= 15:
+                photos.setdefault(digits, path)
+    return photos
+
+
+def _apply_message_cards(conn: sqlite3.Connection, rows: list) -> None:
+    """Attach link-preview cards and poll options stored for these messages."""
+    ids = [r.get("msg_id") for r in rows if r.get("msg_id")]
+    if not ids or conn is None:
+        return
+    placeholders = ",".join("?" * len(ids))
+    previews = {
+        r["message_row_id"]: r
+        for r in conn.execute(
+            f"""
+            SELECT message_row_id, page_title, description, url
+            FROM message_text
+            WHERE message_row_id IN ({placeholders})
+              AND page_title IS NOT NULL AND page_title != ''
+            """,
+            ids,
+        )
+    }
+    options: dict = {}
+    for r in conn.execute(
+        f"""
+        SELECT message_row_id, option_name, vote_total
+        FROM message_poll_option
+        WHERE message_row_id IN ({placeholders})
+        ORDER BY _id
+        """,
+        ids,
+    ):
+        options.setdefault(r["message_row_id"], []).append(
+            {"name": r["option_name"] or "", "votes": r["vote_total"] or 0}
+        )
+    for row in rows:
+        preview = previews.get(row.get("msg_id"))
+        if preview:
+            row["link_title"] = preview["page_title"]
+            row["link_description"] = preview["description"] or ""
+            row["link_url"] = preview["url"] or ""
+        poll = options.get(row.get("msg_id"))
+        if poll:
+            row["media_type"] = "poll"
+            row["poll_options"] = poll
+    thumbs = {
+        r[0]
+        for r in conn.execute(
+            f"""
+            SELECT message_row_id FROM message_thumbnail
+            WHERE message_row_id IN ({placeholders})
+              AND thumbnail IS NOT NULL AND length(thumbnail) > 40
+            """,
+            ids,
+        )
+    }
+    mention_rows = conn.execute(
+        f"""
+        SELECT mm.message_row_id AS msg_id,
+               j.user AS raw_user,
+               COALESCE(
+                 NULLIF(con.display_name, ''),
+                 NULLIF(con_phone.display_name, '')
+               ) AS saved_name,
+               COALESCE(
+                 CASE WHEN j.server = 's.whatsapp.net' THEN j.user END,
+                 jp.user
+               ) AS phone
+        FROM message_mentions mm
+        JOIN jid j ON j._id = mm.jid_row_id
+        LEFT JOIN (
+            SELECT lid_row_id, MIN(jid_row_id) AS jid_row_id
+            FROM jid_map GROUP BY lid_row_id
+        ) jm ON jm.lid_row_id = j._id
+        LEFT JOIN jid jp ON jp._id = jm.jid_row_id
+        LEFT JOIN arch.contacts con
+          ON con.number = CASE WHEN j.server = 's.whatsapp.net' THEN j.user END
+        LEFT JOIN arch.contacts con_phone ON con_phone.number = jp.user
+        WHERE mm.message_row_id IN ({placeholders})
+        """,
+        ids,
+    ).fetchall()
+    by_msg: dict = {}
+    for mention in mention_rows:
+        raw = mention["raw_user"] or ""
+        if not raw:
+            continue
+        by_msg.setdefault(mention["msg_id"], {})[raw] = {
+            "raw": raw,
+            "label": mention["saved_name"] or "",
+            "phone": mention["phone"] or "",
+        }
+    for row in rows:
+        if row.get("msg_id") in thumbs and row.get("link_title"):
+            row["link_thumb"] = 1
+        mentions = list(by_msg.get(row.get("msg_id"), {}).values())
+        if mentions:
+            row["mentions"] = mentions
+    stored = {
+        r["msg_id"]: r
+        for r in conn.execute(
+            f"""
+            SELECT _id AS msg_id, status, from_me, origination_flags
+            FROM message WHERE _id IN ({placeholders})
+            """,
+            ids,
+        )
+    }
+    for row in rows:
+        meta = stored.get(row.get("msg_id"))
+        if not meta:
+            continue
+        if meta["from_me"]:
+            status = meta["status"]
+            if status in (8, 13):
+                row["receipt"] = "read"
+            elif status == 5:
+                row["receipt"] = "delivered"
+            elif status in (0, 2, 4):
+                row["receipt"] = "sent"
+        if meta["origination_flags"] and (meta["origination_flags"] & 1):
+            row["forwarded"] = 1
+
+
+def _apply_reaction_previews(conn: sqlite3.Connection, chats: list) -> None:
+    """When a reaction is the newest activity, show it as the chat-list preview."""
+    ids = [d.get("last_reaction_id") for d in chats if d.get("last_reaction_id")]
+    by_id = {}
+    if ids:
+        placeholders = ",".join("?" * len(ids))
+        for rx in conn.execute(
+            f"""
+            SELECT ao._id AS id, ao.timestamp AS ts, ao.from_me,
+                   r.reaction AS emoji, m.message_type, mm.file_path,
+                   substr(COALESCE(m.text_data, ''), 1, 40) AS text
+            FROM message_add_on ao
+            JOIN message_add_on_reaction r ON r.message_add_on_row_id = ao._id
+            JOIN message m ON m._id = ao.parent_message_row_id
+            LEFT JOIN message_media mm ON mm.message_row_id = m._id
+            WHERE ao._id IN ({placeholders})
+              AND r.reaction IS NOT NULL AND r.reaction != ''
+            """,
+            ids,
+        ):
+            by_id[rx["id"]] = rx
+    kinds = {
+        1: "📷 Photo",
+        2: "🎵 Audio",
+        3: "🎥 Video",
+        9: "📄 Document",
+        13: "🎞 GIF",
+        15: "🎭 Sticker",
+        20: "🎭 Sticker",
+    }
+    for chat in chats:
+        rx = by_id.get(chat.get("last_reaction_id"))
+        chat.pop("last_reaction_id", None)
+        if not rx or (rx["ts"] or 0) < (chat.get("newest_ts") or 0):
+            continue
+        kind = kinds.get(rx["message_type"])
+        if not kind and rx["file_path"]:
+            mapped = {
+                "image": "📷 Photo",
+                "video": "🎥 Video",
+                "audio": "🎵 Audio",
+                "gif": "🎞 GIF",
+                "sticker": "🎭 Sticker",
+                "document": "📄 Document",
+            }.get(_media_type_from_path(rx["file_path"]))
+            kind = mapped
+        if kind:
+            target = f'"{kind}"'
+        elif rx["text"]:
+            target = f'"{rx["text"]}"'
+        else:
+            target = "a message"
+        who = "You reacted" if rx["from_me"] else "Reacted"
+        chat["last_msg_preview"] = f"{who} {rx['emoji']} to {target}"
+        chat["last_msg_type"] = "text"
+        chat["last_msg_from_me"] = 0
+        chat["last_msg_sender"] = ""
+        chat["newest_ts"] = rx["ts"]
+
+
+def _apply_sender_labels(conn: sqlite3.Connection, rows: list) -> None:
+    """Replace cached sender strings with the address-book name, or the
+    profile name stored on the lid, using only rows in this database."""
+    ids = [r.get("msg_id") for r in rows if r.get("msg_id")]
+    if not ids or conn is None:
+        return
+    has_lid = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='lid_display_name'"
+    ).fetchone()
+    lid_join = (
+        """
+        LEFT JOIN lid_display_name ldn_direct ON ldn_direct.lid_row_id = m.sender_jid_row_id
+        LEFT JOIN lid_display_name ldn_mapped ON ldn_mapped.lid_row_id = jm_rev.lid_row_id
+        """
+        if has_lid
+        else ""
+    )
+    lid_cols = (
+        "NULLIF(ldn_direct.display_name, '') AS push_direct, "
+        "NULLIF(ldn_mapped.display_name, '') AS push_mapped"
+        if has_lid
+        else "NULL AS push_direct, NULL AS push_mapped"
+    )
+    placeholders = ",".join("?" * len(ids))
+    found = conn.execute(
+        f"""
+        SELECT m._id AS msg_id,
+               NULLIF(con.display_name, '') AS saved_name,
+               {lid_cols},
+               COALESCE(
+                   CASE WHEN j_phone.server = 's.whatsapp.net' THEN j_phone.user END,
+                   CASE WHEN j.server = 's.whatsapp.net' THEN j.user END
+               ) AS phone
+        FROM message m
+        JOIN jid j ON j._id = m.sender_jid_row_id
+        LEFT JOIN (
+            SELECT lid_row_id, MIN(jid_row_id) AS jid_row_id
+            FROM jid_map GROUP BY lid_row_id
+        ) jm ON jm.lid_row_id = m.sender_jid_row_id
+        LEFT JOIN jid j_phone ON j_phone._id = jm.jid_row_id
+        LEFT JOIN (
+            SELECT jid_row_id, MIN(lid_row_id) AS lid_row_id
+            FROM jid_map GROUP BY jid_row_id
+        ) jm_rev ON jm_rev.jid_row_id = COALESCE(j_phone._id, m.sender_jid_row_id)
+        {lid_join}
+        LEFT JOIN arch.contacts con
+          ON con.number = COALESCE(
+               CASE WHEN j_phone.server = 's.whatsapp.net' THEN j_phone.user END,
+               CASE WHEN j.server = 's.whatsapp.net' THEN j.user END
+             )
+        WHERE m._id IN ({placeholders})
+        """,
+        ids,
+    ).fetchall()
+    by_id = {r["msg_id"]: r for r in found}
+    for row in rows:
+        info = by_id.get(row.get("msg_id"))
+        if not info:
+            continue
+        saved = info["saved_name"]
+        push = info["push_direct"] or info["push_mapped"]
+        phone = info["phone"] or ""
+        if push and (
+            "\u2219" in push
+            or "•" in push
+            or (phone and re.sub(r"\D", "", push) == phone)
+            or re.fullmatch(r"[+\d\s().-]+", push)
+        ):
+            push = None
+        row["sender_phone"] = phone
+        row["sender_saved"] = 1 if saved else 0
+        if saved:
+            row["sender"] = saved
+        elif push:
+            row["sender"] = push
 
 
 def _ios_chat_filter(chat_id: str) -> tuple[str, list]:
@@ -2758,6 +3328,7 @@ def create_app(output_root: Path, rescan: bool = False):
         OR (m.message_type IS NOT NULL AND m.message_type != 0 AND m.message_type != 7 AND mm.file_path IS NOT NULL)
         OR (m.message_type IN (4, 14))
         OR (m.message_type = 7 AND {ms_action_clause})
+        OR (m.message_type = 66)
     )
     """
     globals()["_ANDROID_FILTER_TS"] = globals()["_ANDROID_FILTER"]
@@ -2833,6 +3404,7 @@ def create_app(output_root: Path, rescan: bool = False):
             WHEN m.message_type = 7 THEN 'service'
             WHEN m.message_type IN (4, 14) THEN 'vcard'
             WHEN m.message_type = 20 THEN 'sticker'
+            WHEN m.message_type = 66 THEN 'poll'
             WHEN m.message_type IS NULL OR m.message_type = 0 THEN
                 CASE WHEN m.text_data IS NOT NULL
                       AND (INSTR(LOWER(m.text_data), 'http://') > 0
@@ -2941,15 +3513,23 @@ def create_app(output_root: Path, rescan: bool = False):
                     CASE WHEN c.subject IS NOT NULL THEN 'group'
                          ELSE 'contact' END                            AS type,
                     COALESCE(
+                        CASE WHEN c.subject IS NOT NULL AND TRIM(c.subject) != '' THEN c.subject END,
                         NULLIF(con.display_name, ''),
                         CASE WHEN COALESCE(j_chat_real.user, j_chat.user) = '0' THEN 'WhatsApp' END,
-                        con.folder,
+                        CASE WHEN con.folder IS NOT NULL AND con.folder != ''
+                                  AND con.folder NOT LIKE 'Unknown (%'
+                             THEN con.folder END,
                         grp.subject,
                         CASE WHEN COALESCE(j_chat_real.user, j_chat.user) IS NOT NULL
                              THEN '+' || COALESCE(j_chat_real.user, j_chat.user)
                              ELSE CAST(c._id AS TEXT) END
                     )                                                   AS display_name,
+                    IFNULL(c.archived, 0)                               AS archived,
+                    IFNULL(c.unseen_message_count, 0)                   AS unseen_count,
+                    IFNULL(c.group_type, 0)                             AS group_type,
                     c.sort_timestamp                                    AS newest_ts,
+                    c.last_message_reaction_row_id                      AS last_reaction_id,
+                    COALESCE(m.status, 0)                              AS last_msg_status,
                     COALESCE(m.text_data, '')                          AS last_msg_preview,
                     COALESCE(m.message_type, 0)                        AS last_msg_type,
                     COALESCE(m.from_me, 0)                             AS last_msg_from_me,
@@ -3008,6 +3588,8 @@ def create_app(output_root: Path, rescan: bool = False):
                         END,
                         CAST(cs.Z_PK AS TEXT)
                     )                                                   AS display_name,
+                    0                                                   AS archived,
+                    0                                                   AS unseen_count,
                     CAST((m.ZMESSAGEDATE + 978307200) * 1000 AS INTEGER) AS newest_ts,
                     COALESCE(m.ZTEXT, '')                              AS last_msg_preview,
                     COALESCE(m.ZMESSAGETYPE, 0)                        AS last_msg_type,
@@ -3166,6 +3748,8 @@ def create_app(output_root: Path, rescan: bool = False):
             last_msg_group_event_type = d.pop("last_msg_group_event_type", None)
             last_msg_sender = d.pop("last_msg_sender", None)
             last_msg_sender_jid = d.pop("last_msg_sender_jid", None)
+            if last_msg_sender:
+                d["last_msg_sender"] = last_msg_sender
             last_msg_member_jid = d.pop("last_msg_member_jid", None)
 
             if source_type == "android" and raw_type == 7:
@@ -3228,7 +3812,50 @@ def create_app(output_root: Path, rescan: bool = False):
                 d["last_msg_type"] = _media_type_from_path(path)
             else:
                 d["last_msg_type"] = "text"
+            d["has_avatar"] = 0
             result.append(d)
+        if source_type == "android" and result:
+            group_ids = {
+                str(r[0])
+                for r in conn.execute(
+                    """
+                    SELECT DISTINCT m.chat_row_id
+                    FROM message_system_photo_change p
+                    JOIN message m ON m._id = p.message_row_id
+                    WHERE p.new_photo IS NOT NULL AND length(p.new_photo) > 100
+                    """
+                )
+            }
+            contact_ids = set(_contact_profile_photos(output_root))
+            favorite_ids = _favorite_contact_ids(conn)
+            pinned_order = _resolve_pinned_chat_ids(conn)
+            pinned_set = set(pinned_order)
+            open_communities = {
+                r["id"]
+                for r in conn.execute(
+                    """
+                    SELECT CAST(c._id AS TEXT) AS id
+                    FROM community_chat cc
+                    JOIN chat c ON c._id = cc.chat_row_id
+                    WHERE cc.closed = 0 AND c.group_type = 3 AND c.hidden = 0
+                    """
+                )
+            }
+            for d in result:
+                if d.get("type") == "group" and str(d.get("id")) in group_ids:
+                    d["has_avatar"] = 1
+                elif d.get("type") == "contact" and re.sub(r"\D", "", str(d.get("id") or "")) in contact_ids:
+                    d["has_avatar"] = 1
+                cid = str(d.get("id") or "")
+                d["is_favorite"] = 1 if (
+                    d.get("type") == "contact" and cid in favorite_ids
+                ) else 0
+                d["is_pinned"] = 1 if cid in pinned_set else 0
+                gt = d.get("group_type") or 0
+                d["is_community"] = 1 if cid in open_communities else 0
+                d["is_announcements"] = 1 if gt == 3 and cid in open_communities else 0
+            _apply_reaction_previews(conn, result)
+            result.sort(key=lambda d: d.get("newest_ts") or 0, reverse=True)
         return jsonify(result)
 
     # ---- API: paginated messages -------------------------------------------
@@ -3282,7 +3909,24 @@ def create_app(output_root: Path, rescan: bool = False):
                         for row in rows:
                             if row["msg_id"] in rx_map:
                                 row["reactions"] = rx_map[row["msg_id"]]
-                return jsonify(rows)
+                _apply_sender_labels(get_wa(), rows)
+                _apply_message_cards(get_wa(), rows)
+                oldest = min(r["timestamp_ms"] or 0 for r in rows)
+                chat_pred, chat_params = _android_chat_filter(chat_id, chat_type)
+                cached_ids = [r["msg_id"] for r in rows]
+                missing_poll = get_wa().execute(
+                    f"""
+                    SELECT 1 FROM message m
+                    WHERE {chat_pred}
+                      AND m.message_type = 66
+                      AND m.timestamp >= ?
+                      AND m._id NOT IN ({",".join("?" * len(cached_ids))})
+                    LIMIT 1
+                    """,
+                    [*chat_params, oldest, *cached_ids],
+                ).fetchone()
+                if not missing_poll:
+                    return jsonify(rows)
 
         conn = get_wa()
         if conn is None:
@@ -3386,6 +4030,10 @@ def create_app(output_root: Path, rescan: bool = False):
             row.pop("raw_msg_type", None)
             row.pop("member_jid", None)
 
+        if source_type == "android":
+            _apply_sender_labels(conn, rows)
+            _apply_message_cards(conn, rows)
+
         if not before and not after:
             threading.Thread(
                 target=_backfill_recent_messages,
@@ -3458,6 +4106,9 @@ def create_app(output_root: Path, rescan: bool = False):
             row.pop("group_event_type", None)
             row.pop("raw_msg_type", None)
             row.pop("member_jid", None)
+        if source_type == "android":
+            _apply_sender_labels(conn, combined)
+            _apply_message_cards(conn, combined)
         return jsonify(_strip_none_reactions(combined))
 
     # ---- API: media gallery ------------------------------------------------
@@ -3704,7 +4355,7 @@ def create_app(output_root: Path, rescan: bool = False):
                     FROM message_index_fts fts
                     JOIN message_index mi ON mi.rowid = fts.rowid
                     WHERE message_index_fts MATCH ?
-                    ORDER BY mi.timestamp_ms ASC LIMIT 100
+                    ORDER BY mi.timestamp_ms DESC LIMIT 100
                 """,
                     (q,),
                 ).fetchall()
@@ -3725,12 +4376,313 @@ def create_app(output_root: Path, rescan: bool = False):
         select = _ANDROID_SELECT if source_type == "android" else _IOS_SELECT
         extra = _ANDROID_FILTER if source_type == "android" else _IOS_FILTER
 
+        order = "DESC" if not chat_id else "ASC"
         rows = wa.execute(
-            f"{select} WHERE {id_col} IN ({placeholders}) {extra} ORDER BY timestamp_ms ASC", rowids
+            f"{select} WHERE {id_col} IN ({placeholders}) {extra} ORDER BY timestamp_ms {order}",
+            rowids,
         ).fetchall()
 
         indexed_count = get_cache().execute("SELECT COUNT(*) FROM indexed_chats").fetchone()[0]
         return jsonify({"results": [dict(r) for r in rows], "indexed_count": indexed_count})
+
+    @app.route("/api/pinned-chats")
+    def api_pinned_chats():
+        conn = get_wa()
+        if conn is None or source_type != "android":
+            return jsonify({"ids": []})
+        return jsonify({"ids": _resolve_pinned_chat_ids(conn)})
+
+    @app.route("/api/communities")
+    def api_communities():
+        conn = get_wa()
+        if conn is None or source_type != "android":
+            return jsonify([])
+        items = _list_open_communities(conn)
+        for item in items:
+            cid = item["id"]
+            item["has_avatar"] = 0
+            item["type"] = "community"
+            buckets = _community_child_buckets(conn, int(cid))
+            item["groups_in_count"] = len(buckets["groups_youre_in"]) + len(
+                buckets["groups_you_can_join"]
+            )
+        return jsonify(items)
+
+    @app.route("/api/community/<community_id>")
+    def api_community_detail(community_id: str):
+        conn = get_wa()
+        if conn is None or source_type != "android" or not community_id.isdigit():
+            return jsonify({"error": "not found"}), 404
+        cid = int(community_id)
+        row = conn.execute(
+            """
+            SELECT CAST(c._id AS TEXT) AS id, c.subject AS name,
+                   IFNULL(c.group_member_count, -1) AS member_count,
+                   IFNULL(c.unseen_message_count, 0) AS unseen_count,
+                   c.sort_timestamp AS newest_ts
+            FROM chat c
+            JOIN community_chat cc ON cc.chat_row_id = c._id
+            WHERE c._id = ? AND c.hidden = 0 AND cc.closed = 0 AND c.group_type = 3
+            """,
+            (cid,),
+        ).fetchone()
+        if not row:
+            return jsonify({"error": "not found"}), 404
+        buckets = _community_child_buckets(conn, cid)
+        ann = dict(row)
+        ann["type"] = "group"
+        ann["is_announcements"] = 1
+        ann["display_name"] = ann.pop("name")
+        try:
+            members = _group_members_android(conn, str(cid))
+        except sqlite3.OperationalError:
+            members = []
+        admins = []
+        owner = None
+        if _android_has_table(conn, "group_participant_user"):
+            try:
+                rank_rows = conn.execute(
+                    """
+                    SELECT gpu.rank,
+                           CASE WHEN j_user.raw_string = 'lid_me' THEN 'You'
+                                ELSE COALESCE(NULLIF(con.display_name, ''), '+' || j_phone.user, 'Unknown')
+                           END AS name
+                    FROM group_participant_user gpu
+                    JOIN chat c ON c._id = ?
+                    JOIN jid j_user ON j_user._id = gpu.user_jid_row_id
+                    LEFT JOIN _jid_map_resolved jm ON jm.lid_row_id = gpu.user_jid_row_id
+                    LEFT JOIN jid j_phone ON j_phone._id = jm.jid_row_id
+                    LEFT JOIN arch.contacts con ON con.number = j_phone.user
+                    WHERE gpu.group_jid_row_id = c.jid_row_id AND gpu.rank > 0
+                    ORDER BY gpu.rank DESC, name
+                    """,
+                    (cid,),
+                ).fetchall()
+                for rr in rank_rows:
+                    if rr["rank"] >= 2 and not owner:
+                        owner = rr["name"]
+                    elif rr["rank"] == 1:
+                        admins.append(rr["name"])
+            except sqlite3.OperationalError:
+                pass
+        group_count = (
+            1
+            + len(buckets["groups_youre_in"])
+            + len(buckets["groups_you_can_join"])
+        )
+        return jsonify(
+            {
+                "id": row["id"],
+                "name": row["name"],
+                "member_count": row["member_count"],
+                "group_count": group_count,
+                "announcements": ann,
+                "groups_youre_in": buckets["groups_youre_in"],
+                "groups_you_can_join": buckets["groups_you_can_join"],
+                "members": members,
+                "owner": owner,
+                "admins": admins,
+            }
+        )
+
+    @app.route("/api/chat-community")
+    def api_chat_community():
+        chat_id = request.args.get("chat_id", "")
+        conn = get_wa()
+        if conn is None or source_type != "android":
+            return jsonify(None)
+        link = _community_for_subgroup(conn, chat_id)
+        return jsonify(link)
+
+    @app.route("/api/groups_in_common")
+    def api_groups_in_common():
+        numbers = [n.strip() for n in request.args.get("numbers", "").split(",") if n.strip()]
+        if not numbers or source_type != "android":
+            return jsonify([])
+        numbers = numbers[:30]
+        conn = get_wa()
+        if conn is None:
+            return jsonify([])
+        table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='group_participant_user'"
+        ).fetchone()
+        if not table:
+            return jsonify([])
+        placeholders = ",".join("?" * len(numbers))
+        rows = conn.execute(
+            f"""
+            SELECT CAST(c._id AS TEXT) AS id,
+                   c.subject AS display_name,
+                   c.sort_timestamp AS newest_ts,
+                   MIN(COALESCE(j_real.user, ju.user)) AS member
+            FROM group_participant_user gpu
+            JOIN jid ju ON ju._id = gpu.user_jid_row_id
+            LEFT JOIN _jid_map_resolved jm ON jm.lid_row_id = gpu.user_jid_row_id
+            LEFT JOIN jid j_real ON j_real._id = jm.jid_row_id
+            JOIN chat c ON c.jid_row_id = gpu.group_jid_row_id
+            WHERE c.hidden = 0
+              AND c.subject IS NOT NULL AND TRIM(c.subject) != ''
+              AND COALESCE(j_real.user, ju.user) IN ({placeholders})
+            GROUP BY c._id
+            ORDER BY c.sort_timestamp DESC
+            LIMIT 12
+            """,
+            numbers,
+        ).fetchall()
+        return jsonify([dict(r) for r in rows])
+
+    @app.route("/api/pinned")
+    def api_pinned():
+        chat_id = request.args.get("chat_id", "")
+        chat_type = request.args.get("chat_type", "")
+        conn = get_wa()
+        if conn is None or source_type != "android" or not chat_id:
+            return jsonify(None)
+        table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='message_add_on_pin_in_chat'"
+        ).fetchone()
+        if not table:
+            return jsonify(None)
+        if chat_type == "group":
+            chat_pred, chat_params = "ao.chat_row_id = CAST(? AS INTEGER)", [chat_id]
+        else:
+            chat_pred, chat_params = "j_chat.user = ?", [chat_id]
+        row = conn.execute(
+            f"""
+            SELECT m._id AS msg_id,
+                   m.timestamp AS timestamp_ms,
+                   pin.pin_in_chat_state AS state,
+                   COALESCE(NULLIF(m.text_data, ''), NULLIF(mm.media_name, ''), '') AS text
+            FROM message_add_on_pin_in_chat pin
+            JOIN message_add_on ao ON ao._id = pin.message_add_on_row_id
+            JOIN message m ON m._id = ao.parent_message_row_id
+            LEFT JOIN message_media mm ON mm.message_row_id = m._id
+            LEFT JOIN chat c ON c._id = ao.chat_row_id
+            LEFT JOIN jid j_chat ON j_chat._id = c.jid_row_id
+            WHERE {chat_pred}
+            ORDER BY pin.sender_timestamp DESC
+            LIMIT 1
+            """,
+            chat_params,
+        ).fetchone()
+        if not row or row["state"] != 1 or not row["text"]:
+            return jsonify(None)
+        return jsonify(
+            {"msg_id": row["msg_id"], "timestamp_ms": row["timestamp_ms"], "text": row["text"]}
+        )
+
+    @app.route("/api/chat-subtitle")
+    def api_chat_subtitle():
+        chat_id = request.args.get("chat_id", "")
+        chat_type = request.args.get("chat_type", "")
+        conn = get_wa()
+        if conn is None or source_type != "android" or chat_type != "group" or not chat_id:
+            return jsonify({"count": 0, "names": []})
+        try:
+            members = _group_members_android(conn, chat_id)
+        except sqlite3.OperationalError:
+            return jsonify({"count": 0, "names": []})
+        names = []
+        seen = set()
+        for member in members:
+            name = (member.get("name") or "").strip()
+            number = re.sub(r"\D", "", member.get("number") or "")
+            digits = re.sub(r"\D", "", name)
+            if (
+                not name
+                or "\u2219" in name
+                or "•" in name
+                or re.fullmatch(r"[+\d\s().-]+", name)
+                or (number and digits == number)
+            ):
+                continue
+            key = name.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            names.append(name)
+        return jsonify({"count": len(members), "names": names[:4]})
+
+    @app.route("/api/starred")
+    def api_starred():
+        conn = get_wa()
+        if conn is None or source_type != "android":
+            return jsonify({"count": 0, "items": []})
+        rows = conn.execute(
+            """
+            SELECT m._id AS msg_id,
+                   m.timestamp AS timestamp_ms,
+                   m.from_me,
+                   COALESCE(NULLIF(m.text_data, ''), NULLIF(mm.media_name, ''), '') AS text,
+                   CASE WHEN j.server = 'g.us' THEN CAST(c._id AS TEXT) ELSE j.user END AS chat_id,
+                   CASE WHEN j.server = 'g.us' THEN 'group' ELSE 'contact' END AS chat_type,
+                   COALESCE(
+                     NULLIF(c.subject, ''),
+                     NULLIF(con.display_name, ''),
+                     '+' || j.user
+                   ) AS chat_name
+            FROM message m
+            JOIN chat c ON c._id = m.chat_row_id
+            JOIN jid j ON j._id = c.jid_row_id
+            LEFT JOIN message_media mm ON mm.message_row_id = m._id
+            LEFT JOIN arch.contacts con
+              ON con.number = j.user AND j.server = 's.whatsapp.net'
+            WHERE m.starred = 1 AND IFNULL(c.hidden, 0) = 0
+            ORDER BY m.timestamp DESC
+            LIMIT 80
+            """
+        ).fetchall()
+        items = [
+            {
+                "msg_id": r["msg_id"],
+                "timestamp_ms": r["timestamp_ms"],
+                "from_me": bool(r["from_me"]),
+                "text": r["text"] or "",
+                "chat_id": r["chat_id"],
+                "chat_type": r["chat_type"],
+                "chat_name": r["chat_name"] or "",
+            }
+            for r in rows
+        ]
+        return jsonify({"count": len(items), "items": items})
+
+    @app.route("/api/avatar")
+    def api_avatar():
+        chat_id = request.args.get("chat_id", "")
+        chat_type = request.args.get("chat_type", "")
+        conn = get_wa()
+        if conn is not None and chat_type == "group" and chat_id.isdigit():
+            row = conn.execute(
+                """
+                SELECT p.new_photo
+                FROM message_system_photo_change p
+                JOIN message m ON m._id = p.message_row_id
+                WHERE m.chat_row_id = ?
+                  AND p.new_photo IS NOT NULL AND length(p.new_photo) > 100
+                ORDER BY m.timestamp DESC
+                LIMIT 1
+                """,
+                (int(chat_id),),
+            ).fetchone()
+            if row and row[0]:
+                return Response(row[0], mimetype="image/jpeg")
+        photo = _contact_profile_photos(output_root).get(re.sub(r"\D", "", chat_id))
+        if photo is not None:
+            return send_from_directory(photo.parent, photo.name)
+        return ("", 404)
+
+    @app.route("/api/link-thumb/<int:message_id>")
+    def api_link_thumb(message_id: int):
+        conn = get_wa()
+        if conn is None:
+            return ("", 404)
+        row = conn.execute(
+            "SELECT thumbnail FROM message_thumbnail WHERE message_row_id = ? AND length(thumbnail) > 40",
+            (message_id,),
+        ).fetchone()
+        if not row:
+            return ("", 404)
+        return Response(row[0], mimetype="image/jpeg")
 
     # ---- API: message receipts -----------------------------------------------
 
