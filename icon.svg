@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" width="200" height="200">
+  <!-- WhatsApp Backup Tools - Repository Logo -->
+  <path d="M100 16 C53.6 16 16 53.6 16 100 C16 116.2 20.6 131.4 28.6 144.3 L18 182 L57.2 171.7 C69.6 179.4 84.3 184 100 184 C146.4 184 184 146.4 184 100 C184 53.6 146.4 16 100 16 Z" fill="#25D366"/>
+  <!-- Archive Box Lid -->
+  <rect x="52" y="74" width="96" height="18" rx="5" fill="#FFFFFF"/>
+  <!-- Archive Box Body -->
+  <rect x="58" y="96" width="84" height="46" rx="6" fill="#FFFFFF"/>
+  <!-- Box Handle Cutout -->
+  <rect x="86" y="106" width="28" height="8" rx="4" fill="#25D366"/>
+</svg>

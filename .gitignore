@@ -1,0 +1,8 @@
+INTERNAL-CHANGELOG.md
+.test_artifacts/
+dist/
+build/
+*.egg-info/
+__pycache__/
+*.pyc
+.venv/
